@@ -31,7 +31,7 @@ class Pass(BaseModel):
 class SatelliteTracker:
     def __init__(self, gs_logger):
         self.gs_logger = gs_logger
-        self.gs_logger.info("Configuring DISCO GS server")
+        self.gs_logger.info("Initializing satellite tracker")
         self.tle_file = "disco.tle"
         self.ts = load.timescale()
 
@@ -42,9 +42,7 @@ class SatelliteTracker:
         
         # Default location (can be overridden)
         self.location = self._load_gs_location()
-        
-        # TLE file location
-        
+
         # Tracking data
         self.tracking_data = {
             "azimuth": 0,
