@@ -41,7 +41,9 @@ class SatelliteTracker:
         self.satellite = None
         self.is_tracking = False
         self.tracking_thread = None
-        self.stop_tracking_event = threading.Event()
+        self.track_stop_event = threading.Event()  # For safely stopping the tracking thread
+        # Thread lock for safe reloading
+        self.lock = threading.Lock()
         
         # Default location (can be overridden)
         self.location = self._load_gs_location()
@@ -55,18 +57,11 @@ class SatelliteTracker:
             "status": "idle",  # idle, waiting or tracking
             "current_pass": None
         }
-        
+
+        self.rotor = None
         # Load the satellite
         self.load_satellite()
         
-        # Load stuff for scheduler
-        self.scheduled_passes = PriorityQueue()
-        self.scheduler_thread = None
-        self.is_scheduler_running = False
-        self.scheduler_stop_event = threading.Event()
-        self.current_scheduled_pass = None
-        self.scheduler_lock = threading.Lock()       
-
     async def _async_init(self):
         self.rotor = await RotorController.initialize()
     
@@ -178,7 +173,10 @@ class SatelliteTracker:
         Returns:
             Pass object
         """
-        start = self.ts.from_datetime(start_date) or self.ts.now()
+        if start_date is None:
+            start = self.ts.now()
+        else:
+            self.ts.from_datetime(start_date)
         t, events = self.satellite.find_events(self.location, start, start + 1, altitude_degrees=deg)
         
         # If no events or incomplete pass, search further
@@ -206,40 +204,38 @@ class SatelliteTracker:
      
     def start_tracking(self, start_date: datetime = None):
         """Start tracking the satellite"""
-        if self.is_tracking:
-            return False
-        
-        if not self.satellite:
-            if not self.load_satellite():
+        with self.lock:
+            if self.is_tracking:
                 return False
-        # Clear previous stop signal
-        self.stop_tracking_event.clear()
 
-        # Find the next pass
-        next_pass = self._get_next_pass(deg=10.0, start_date=start_date)
-        if not next_pass:
-            self.gs_logger.error(f"No upcoming passes found for {self.satellite_name}")
-            return False
-        
-        # Update tracking data
-        self.tracking_data["status"] = "waiting"
-        self.tracking_data["current_pass"] = next_pass
+            if not self.satellite:
+                if not self.load_satellite():
+                    return False
+                
+            self.track_stop_event.clear()
+            # Find the next pass
+            next_pass = self._get_next_pass(deg=10.0, start_date=start_date)
+            if not next_pass:
+                self.gs_logger.error(f"No upcoming passes found for {self.satellite_name}")
+                return False
+
+            # Update tracking data
+            self.tracking_data["status"] = "waiting"
+            self.tracking_data["current_pass"] = next_pass
+
+            # Start tracking thread
+            self.tracking_thread = threading.Thread(
+                target=self._track_satellite_thread,
+                args=(next_pass,)
+            )
+            self.tracking_thread.daemon = True
+            self.tracking_thread.start()
+
+            self.is_tracking = True
+            self.gs_logger.info(f"Started tracking {self.satellite_name}, next pass at {next_pass.rise}")
+            return True
     
-
-
-        # Start tracking thread
-        self.tracking_thread = threading.Thread(
-            target=self._track_satellite,
-            args=(next_pass,)
-        )
-        self.tracking_thread.daemon = True
-        self.tracking_thread.start()
-        
-        self.is_tracking = True
-        self.gs_logger.info(f"Started tracking {self.satellite_name}, next pass at {next_pass.rise}")
-        return True
-    
-    async def _track_satellite(self, sat_pass):
+    async def _track_satellite_thread(self, sat_pass):
         """Track the satellite during a pass"""
         # Sleep till the rise time
         now = datetime.now(timezone.utc)
@@ -248,15 +244,14 @@ class SatelliteTracker:
         if time_till_rise > 0:
             self.gs_logger.info(f"Waiting until rise time for {self.satellite_name}: {sat_pass.rise}")
             self.tracking_data["status"] = "waiting"
-            if self.stop_tracking_event.wait(timeout=time_till_rise):
-                self.gs_logger.info(f"Tracking canceled before rise time for {self.satellite_name}")
-                self.tracking_data["status"] = "idle"
-                self.is_tracking = False
-                return
-
             # Sleep until rise time
-            # threading.Event().wait(time_till_rise)
-        
+            self.track_stop_event.wait(time_till_rise)
+
+         # Check if we were stopped during wait
+            if self.track_stop_event.is_set():
+                self.gs_logger.info("Tracking was stopped during wait period")
+                self._cleanup_tracking()
+                return
         # Update status
         self.tracking_data["status"] = "tracking"
         
@@ -294,27 +289,31 @@ class SatelliteTracker:
                 self.gs_logger.info(f"Satellite {self.satellite_name} below horizon, stopping tracking")
                 break
                 
-            if self.stop_tracking_event.wait(timeout=1):
-                break
+            # Sleep for a short time before updating
+            threading.Event().wait(1)
+        
         # Update status
         self.tracking_data["status"] = "idle"
         self.is_tracking = False
     
     def stop_tracking(self):
         """Stop tracking the satellite"""
-        if not self.is_tracking:
-            return False
-
-        self.stop_tracking_event.set()
-        
-        if self.tracking_thread and self.tracking_thread.is_alive():
-            self.tracking_thread.join(timeout=2.0)  # Wait up to 2 seconds for thread to finish
-
-        self.is_tracking = False
-        self.tracking_data["status"] = "idle"
-        self.tracking_data["current_pass"] = None
-        self.gs_logger.info(f"Stopped tracking satellite {self.satellite_name}")
-        return True
+        with self.lock:    
+            if not self.is_tracking:
+                return False
+            self.track_stop_event.set()
+            
+            # Wait for thread to finish (with timeout)
+            if self.tracking_thread and self.tracking_thread.is_alive():
+                self.tracking_thread.join(timeout=2.0)
+            
+            # Update status
+            self.tracking_data["status"] = "idle"
+            self.tracking_data["current_pass"] = None
+            self.is_tracking = False
+            
+            self.gs_logger.info(f"Stopped tracking satellite {self.satellite_name}")
+            return True
     
     def get_tracking_data(self):
         """Get the latest tracking data"""
@@ -330,83 +329,32 @@ class SatelliteTracker:
     
     def reload_satellite(self):
         """Reload the satellite. This should be done when there is a fresh TLE"""
-        if self.is_tracking:
-            self.gs_logger.error("Cannot reload satellite while GS is tracking")
-            return False
+        with self.lock:
+            self.gs_logger.info(f"Reloading satellite {self.satellite_name}")
+        
+            if self.is_tracking:
+                self.gs_logger.error("Cannot reload satellite while GS is tracking")
+                return False
+        
         return self.load_satellite()
-
-    def start_scheduler(self):
-        if self.is_scheduler_running:
-            return False
-        
-        self.scheduler_stop_event.clear()
-        self.is_scheduler_running = True
-        self.scheduler_thread = threading.Thread(target=self._scheduler_loop)
-        self.scheduler_thread.daemon = True
-        self.scheduler_thread.start()
-        self.gs_logger.info("Pass scheduler started")
-        return True
-
-    def stop_scheduler(self):
-        if not self.is_scheduler_running:
-            return False
-
-        self.scheduler_stop_event.set()
-
-        if self.scheduler_thread and self.scheduler_thread.is_alive():
-            self.scheduler_thread.join(timeout=2.0)
-        
-        if self.is_tracking:
-            self.stop_tracking()
-        
-        self.is_scheduler_running = False
-        self.gs_logger.info("Pass scheduler stopped")
-        return True
-
-    def schedule_pass(self, pass: Pass):
-        with self.scheduler_lock:
-            now = datetieme.now
-            if pass.rise <= now:
-                self.gs_logger.error("Cannot schedule a pass that has already started")
-                return False
-
-            one_week_later = now + timedelta(days=7)
-            if pass.rise > one_week_later:
-                self.gs_logger.error("Cannot schedule a pass that starts a week from now")
-                return False
-
-            if self._is_overlapping(pass):
-                self.gs_logger.error("Cannot schedule a pass that is overlapping another pass")
-                return False
-            
-            self.scheduled_passes.put((pass_obj.rise, pass_obj))
-            self.gs_logger.info(f"Scheduled pass for {self.satellite_name} at {pass_obj.rise}")
-            return True
-
-    def _is_overlapping(self, new_pass):
-        """ Check if passes are overlapping with other passes """
-        if self.tracking and self.tracking_data["current_pass"]:
-            current_pass = self.tracking_data["current_pass"]
-            # Is this really the right checks?
-            if new_pass.rise < current_pass.set and new_pass.set > current_pass.rise:
-                return True
-            if new_pass.rise > current_pass.rise and new_pass.rise < current_pass.set:
-                return True
-
-        tmp_q = PriorityQueue()
-        has_overlap = False
-
-        while not self.schedueled_pass.empty()
-            priority, pass = self.schedueled_pass.get()
-            # Right checks?
-            if new_pass.rise < pass.set and new_pass.set > pass.rise:
-                has_overlap = True
-            if new_pass.rise > pass.rise and new_pass.rise < pass.set:
-                has_overlap = True
-
-            tmp_q.put((priority, pass))
-
-        # Restore the priority queue
-        while not tmp_q.empty():
-            self.schedueled_passes.put(tmp_q.get())
-        return has_overlap
+    
+    def initialize_scheduler(self):
+        """Initialize the pass scheduler"""
+        from scheduler import PassScheduler  # Import here to avoid circular imports
+        self.pass_scheduler = PassScheduler(self)
+        self.pass_scheduler.start_scheduler()
+        return self.pass_scheduler
+    
+    # Add this method to get all scheduled passes
+    def get_scheduled_passes(self):
+        """Get all scheduled passes"""
+        if hasattr(self, 'pass_scheduler'):
+            return self.pass_scheduler.get_scheduled_passes()
+        return []
+    
+    # Add this method to schedule a specific pass
+    def schedule_pass(self, pass_obj):
+        """Schedule a specific pass"""
+        if hasattr(self, 'pass_scheduler'):
+            return self.pass_scheduler.schedule_pass(pass_obj)
+        return False

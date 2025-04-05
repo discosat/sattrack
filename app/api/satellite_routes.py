@@ -17,7 +17,7 @@ async def get_satellite_info(tracker = Depends(get_tracker)):
 @satellite_router.get('/position')
 async def get_satellite_position(tracker = Depends(get_tracker)):
     """Get current position of the satellite"""
-    position = tracker.get_sat_position(tracker = Depends(get_tracker))
+    position = tracker.get_sat_position()
     if position:
         return position
     raise HTTPException(status_code=404, detail="Satellite position not available")
@@ -53,7 +53,7 @@ async def get_next_pass(
 
     return next_pass.to_dict()
 
-@satellite_router.post('/reload_tle')
+@satellite_router.post('/reload')
 async def reload_sat_tle(tracker = Depends(get_tracker)):
     """Reload the starfield satellite object with fresh tle data."""
     success = tracker.reload_satellite()
