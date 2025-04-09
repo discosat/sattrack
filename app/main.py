@@ -3,7 +3,7 @@ import logging
 import os
 import uvicorn
 
-from core.logging_config import LOGGING_CONFIG
+from config.logging_config import LOGGING_CONFIG
 from api.satellite_routes import satellite_router
 from api.system_routes import system_router
 from api.rotor_routes import rotor_router
