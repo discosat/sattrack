@@ -162,7 +162,26 @@ class SatelliteTracker:
                     json.dump(p.to_dict(), f)
                     f.write('\n')
 
-    
+    def _read_persistent_passes(self):
+        with self.lock:
+            persistent_file_name = os.path.join(PERSISTENCE_FOLDER, "schedueled_passes.json")
+            # Check if file exists and there are passes to load
+            if os.path.isfile(persistent_file_name) and not os.stat(persistent_file_name).st_size == 0:
+                self.gs_logger.info("Found persistent file with passes")
+                with open(persistent_file_name, 'r') as f:
+                    lines = f.readlines()
+                    for line in lines:
+                        schedueled_pass_dict = json.loads(line)
+                        # Make it a Pass object
+                        schedueled_pass = Pass(
+                                rise=schedueled_pass_dict["rise"],
+                                culminate=schedueled_pass_dict["culminate"],
+                                set=schedueled_pass_dict["set"]
+                        )
+                        self.scheduled_passes.put(schedueled_pass)
+                        # Update list of scheduled passes for API
+                        self._update_scheduled_passes_list()
+                
     def _start_scheduler(self):
         """Start the scheduler thread"""
         with self.lock:
@@ -170,6 +189,9 @@ class SatelliteTracker:
                 return
                 
             self.scheduler_stop_event.clear()
+            # If there are schedueled passes add them
+            self._read_persistent_passes()
+
             self.scheduler_thread = threading.Thread(target=self._scheduler_thread)
             self.scheduler_thread.daemon = True
             self.scheduler_thread.start()
