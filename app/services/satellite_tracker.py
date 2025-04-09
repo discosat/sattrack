@@ -4,9 +4,11 @@ from datetime import datetime, timezone, timedelta
 import os
 from queue import PriorityQueue
 from typing import Optional, List
-
+import json
 from services.rotor_controller import RotorController
 from services.satellite import Satellite, Pass
+
+PERSISTENCE_FOLDER = os.path.join(os.path.dirname(__file__), "../persistence") 
 
 class SatelliteTracker:
     def __init__(self, gs_logger):
@@ -153,6 +155,13 @@ class SatelliteTracker:
                 
             # Update tracking data with serializable pass info
             self.tracking_data["scheduled_passes"] = [p.to_dict() for p in passes_list]
+
+            # Update persistence file with current passes
+            with open(os.path.join(PERSISTENCE_FOLDER, "schedueled_passes.json"), 'w') as f:
+                for p in passes_list:
+                    json.dump(p.to_dict(), f)
+                    f.write('\n')
+
     
     def _start_scheduler(self):
         """Start the scheduler thread"""
