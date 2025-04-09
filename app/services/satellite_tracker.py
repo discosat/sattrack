@@ -1,242 +1,264 @@
-"""
-Assumes that only one satellite is in tle file. If there are multiple it will take the first one
-"""
-
 import threading
-import os
+import asyncio
 from datetime import datetime, timezone, timedelta
-from skyfield.api import load, wgs84
-from skyfield.iokit import parse_tle_file
-from pydantic import BaseModel
-import subprocess
-from services.rotor_controller import RotorController
-
+import os
 from queue import PriorityQueue
+from typing import Optional, List
 
-CONFIG_DIR = os.path.join(os.path.dirname(__file__), "../config")
-TLE_FILE_PATH = os.path.join(CONFIG_DIR, "disco.tle")
-
-class Pass(BaseModel):
-    # Times are in UTC
-    rise: datetime
-    culminate: datetime
-    set: datetime
-    
-    def to_dict(self):
-        """Convert Pass object to dictionary for JSON serialization"""
-        return {
-            "rise": self.rise.isoformat(),
-            "culminate": self.culminate.isoformat(),
-            "set": self.set.isoformat()
-        }
+from services.rotor_controller import RotorController
+from services.satellite import Satellite, Pass
 
 class SatelliteTracker:
     def __init__(self, gs_logger):
         self.gs_logger = gs_logger
         self.gs_logger.info("Initializing satellite tracker")
-        self.tle_file = "disco.tle"
-        self.ts = load.timescale()
-
-        self.satellite_name = None
-        self.satellite = None
+        
+        # Tracking state
         self.is_tracking = False
         self.tracking_thread = None
-        self.track_stop_event = threading.Event()  # For safely stopping the tracking thread
-        # Thread lock for safe reloading
-        self.lock = threading.Lock()
+        self.track_stop_event = threading.Event()
+        self.lock = threading.RLock()
         
-        # Default location (can be overridden)
-        self.location = self._load_gs_location()
-
+        # Scheduling state
+        self.scheduled_passes = PriorityQueue()
+        self.scheduler_thread = None
+        self.scheduler_stop_event = threading.Event()
+        self.is_scheduling = False
+        
         # Tracking data
         self.tracking_data = {
             "azimuth": 0,
             "elevation": 0,
             "distance": 0,
             "last_updated": None,
-            "status": "idle",  # idle, waiting or tracking
-            "current_pass": None
+            "status": "idle",  # idle, waiting, tracking
+            "current_pass": None,
+            "scheduled_passes": []
         }
 
         self.rotor = None
-        # Load the satellite
-        self.load_satellite()
+        self.satellite = Satellite(gs_logger)
+        self.satellite_name = self.satellite.satellite_name
         
+        # Start the scheduler immediately
+        self._start_scheduler()
+    
     async def _async_init(self):
+        """Asynchronous initialization for the rotor controller"""
         self.rotor = await RotorController.initialize()
+        return self
     
-    def _load_gs_location(self):
-        """Load location from file or use default"""
-        try:
-            with open("location.txt", "r") as file:
-                lines = file.readlines()
-                latitude = float(lines[0].strip())
-                longitude = float(lines[1].strip())
-                self.gs_logger.info(f"Loaded location: {latitude}, {longitude}")
-        except (FileNotFoundError, IndexError, ValueError):
-            # Default location (Aarhus)
-            latitude = 56.162937
-            longitude = 10.203921
-            self.gs_logger.info(f"Using default location: {latitude}, {longitude}")
-        
-        return wgs84.latlon(latitude, longitude)
+    @classmethod
+    async def initialize(cls, gs_logger):
+        """Factory method for creating and initializing the tracker"""
+        tracker = cls(gs_logger)
+        return await tracker._async_init()
     
-    def load_satellite(self) -> bool:
-        """Load the satellite from its TLE file"""        
-        # Check if file exists
-        if not os.path.exists(TLE_FILE_PATH):
-            self.gs_logger.error(f"TLE file not found")
-            return False
-        
-        try:
-            with load.open(TLE_FILE_PATH) as f:
-                satellites = list(parse_tle_file(f, self.ts))
-            
-            if not satellites:
-                self.gs_logger.error(f"No satellites found in TLE file")
+    def reload_satellite(self):
+        """Reload the satellite TLE data"""
+        with self.lock:
+            if self.is_tracking:
+                self.gs_logger.error("Cannot reload satellite while tracking")
                 return False
-            
-            self.satellite = satellites[0]
-            self.satellite_name = self.satellite.name
-            self.gs_logger.info(f"Loaded satellite: {self.satellite_name}")
-            return True
-        except Exception as e:
-            self.gs_logger.error(f"Error loading satellite {self.satellite_name}: {str(e)}")
-            return False
-    
-    def get_sat_position(self) -> dict:
-        """Get current latitude and longitude of the satellite"""
-        if not self.satellite:
-            return None
-        
-        # Get current position
-        t = self.ts.now()
-        geocentric = self.satellite.at(t)
-        
-        subpoint = geocentric.subpoint()
-        
-        return {
-            "satellite": self.satellite_name,
-            "latitude": subpoint.latitude.degrees,
-            "longitude": subpoint.longitude.degrees,
-            "elevation": subpoint.elevation.m,
-            "timestamp": t.utc_datetime().isoformat()
-        }
-    
-    def get_passes(self, start_time=None, end_time=None, min_elevation=5.0) -> list[Pass]:
-        """Get passes for the satellite in a given time frame"""
-        if not self.satellite:
-            return []
-        
-        if start_time is None:
-            start_time = datetime.now(timezone.utc)
-        
-        if end_time is None:
-            end_time = start_time + timedelta(days=1)
-        
-        return self._get_passes(start_time, end_time, min_elevation)
-    
-    def _get_passes(self, start: datetime, end: datetime, deg: float=5.0) -> list[Pass]:
-        """
-        Get the passes for the satellite in a given time frame
-        Args:
-            start: datetime object (UTC)
-            end: datetime object (UTC)
-            deg: minimum elevation in degrees
-        Returns:
-            list of passes
-        """
-        acc = []
-        t, events = self.satellite.find_events(self.location, self.ts.from_datetime(start), 
-                                   self.ts.from_datetime(end), altitude_degrees=deg)
-        
-        for i in range(0, len(events), 3):
-            if i+2 < len(events) and events[i] == 0 and events[i+1] == 1 and events[i+2] == 2:
-                acc.append(Pass(rise=t[i].utc_datetime(), 
-                               culminate=t[i+1].utc_datetime(),
-                               set=t[i+2].utc_datetime()))
-        return acc
-    
-    def get_next_pass(self, min_elevation: float=5.0) -> Pass:
-        """Get the next pass for the satellite"""
-        if not self.satellite:
-            return None
-        
-        return self._get_next_pass(min_elevation)
-    
-    def _get_next_pass(self, deg: float=10.0, start_date: datetime = None) -> Pass:
-        """
-        Get the next pass for the satellite
-        Args:
-            deg: minimum elevation in degrees
-            start_date: The date to start the search from. UTC time shall be provided
-        Returns:
-            Pass object
-        """
-        if start_date is None:
-            start = self.ts.now()
-        else:
-            self.ts.from_datetime(start_date)
-        t, events = self.satellite.find_events(self.location, start, start + 1, altitude_degrees=deg)
-        
-        # If no events or incomplete pass, search further
-        attempts = 0
-        max_attempts = 10  # Limit search to prevent infinite loop
-        
-        while attempts < max_attempts:
-            if len(events) >= 3 and events[0] == 0 and events[1] == 1 and events[2] == 2:
-                return Pass(rise=t[0].utc_datetime(), 
-                           culminate=t[1].utc_datetime(),
-                           set=t[2].utc_datetime())
-            
-            # Search further ahead
-            if len(events) > 0:
-                start = t[-1] + 0.1  # Add a little time to avoid same events
-            else:
-                start = start + 1  # Add a day if no events found
                 
-            t, events = self.satellite.find_events(self.location, start, start + 1, altitude_degrees=deg)
-            attempts += 1
+            return self.satellite.load_satellite()
+    
+    def _can_schedule_pass(self, pass_to_schedule: Pass) -> bool:
+        """
+        Check if a pass can be scheduled based on constraints:
+        - Not more than a week from now
+        - Not overlapping with existing scheduled passes
+        """
+        # Check if pass is in the future
+        now = datetime.now(timezone.utc)
         
-        self.gs_logger.warning(f"Could not find next pass after {max_attempts} attempts")
-        return None
+        # Check if pass has already ended
+        if pass_to_schedule.set < now:
+            self.gs_logger.error("Cannot schedule a pass that has already ended")
+            return False
+            
+        # Check if pass is more than a week away
+        one_week_from_now = now + timedelta(days=7)
+        if pass_to_schedule.rise > one_week_from_now:
+            self.gs_logger.error("Cannot schedule passes more than a week in advance")
+            return False
+            
+        # Check for overlap with existing scheduled passes
+        # Get a copy of all passes without emptying the queue
+        temp_queue = PriorityQueue()
+        has_overlap = False
         
-     
-    def start_tracking(self, start_date: datetime = None):
-        """Start tracking the satellite"""
+        while not self.scheduled_passes.empty():
+            existing_pass = self.scheduled_passes.get()
+            temp_queue.put(existing_pass)
+            
+            # Check for overlap
+            # Pass overlaps if:
+            # - New pass rise time is between existing pass rise and set
+            # - New pass set time is between existing pass rise and set
+            # - New pass completely contains existing pass
+            if ((existing_pass.rise <= pass_to_schedule.rise <= existing_pass.set) or
+                (existing_pass.rise <= pass_to_schedule.set <= existing_pass.set) or
+                (pass_to_schedule.rise <= existing_pass.rise and pass_to_schedule.set >= existing_pass.set)):
+                has_overlap = True
+        
+        # Restore the queue
+        while not temp_queue.empty():
+            self.scheduled_passes.put(temp_queue.get())
+            
+        if has_overlap:
+            self.gs_logger.error("Cannot schedule overlapping passes")
+            return False
+            
+        return True
+    
+    def _correct_pass(self, pass_to_correct: datetime) -> Pass:
+        return self.satellite.get_next_pass(start_date=pass_to_correct)
+
+    def schedule_pass(self, pass_to_schedule_rise: datetime) -> bool:
+        """Schedule a specific satellite pass for tracking"""
+        with self.lock:
+            # We should correct the given pass to an actual pass from the satellite
+            pass_to_schedule = self._correct_pass(pass_to_schedule_rise)
+
+            # Check if pass is valid according to constraints
+            if not self._can_schedule_pass(pass_to_schedule):
+                return False
+                
+            # Add to priority queue
+            self.scheduled_passes.put(pass_to_schedule)
+            
+            # Update list of scheduled passes for API
+            self._update_scheduled_passes_list()
+                
+            self.gs_logger.info(f"Scheduled pass at {pass_to_schedule.rise}")
+            return True
+            
+    def _update_scheduled_passes_list(self):
+        """Update the list of scheduled passes in tracking data"""
+        # Get a copy of all passes without emptying the queue
+        with self.lock:
+            temp_queue = PriorityQueue()
+            passes_list = []
+            
+            # Empty the queue into our list and temp queue
+            while not self.scheduled_passes.empty():
+                pass_obj = self.scheduled_passes.get()
+                passes_list.append(pass_obj)
+                temp_queue.put(pass_obj)
+                
+            # Restore the queue
+            while not temp_queue.empty():
+                self.scheduled_passes.put(temp_queue.get())
+                
+            # Update tracking data with serializable pass info
+            self.tracking_data["scheduled_passes"] = [p.to_dict() for p in passes_list]
+    
+    def _start_scheduler(self):
+        """Start the scheduler thread"""
+        with self.lock:
+            if self.is_scheduling:
+                return
+                
+            self.scheduler_stop_event.clear()
+            self.scheduler_thread = threading.Thread(target=self._scheduler_thread)
+            self.scheduler_thread.daemon = True
+            self.scheduler_thread.start()
+            self.is_scheduling = True
+            self.gs_logger.info("Satellite pass scheduler started")
+    
+    def _scheduler_thread(self):
+        """Thread that manages scheduled passes"""
+        while not self.scheduler_stop_event.is_set():
+            with self.lock:
+                # If no passes scheduled, just check again later
+                if self.scheduled_passes.empty():
+                    self.lock.release()
+                    try:
+                        # Sleep for a minute then check again
+                        self.scheduler_stop_event.wait(60)
+                        if self.scheduler_stop_event.is_set():
+                            break
+                    finally:
+                        # Reacquire lock
+                        self.lock.acquire()
+                    continue
+                    
+                # Peek at next pass
+                next_pass = self.scheduled_passes.queue[0]
+                now = datetime.now(timezone.utc)
+                
+                # If too far in the future, sleep and check again
+                time_till_pass = (next_pass.rise - now).total_seconds() - 300  # 5 min before pass
+                
+                if time_till_pass > 60:  # If more than a minute away
+                    # Release lock during sleep
+                    self.lock.release()
+                    try:
+                        # Sleep for a minute then check again
+                        self.scheduler_stop_event.wait(60)
+                        if self.scheduler_stop_event.is_set():
+                            break
+                    finally:
+                        # Reacquire lock
+                        self.lock.acquire()
+                    continue
+                    
+                # If it's time to prepare for the pass
+                if time_till_pass <= 60:
+                    # Remove from queue
+                    self.scheduled_passes.get()
+                    
+                    # Start tracking if not already tracking
+                    if not self.is_tracking:
+                        self._start_tracking(next_pass)
+                        
+                    # Update scheduled passes list
+                    self._update_scheduled_passes_list()
+            
+            # Sleep briefly before checking again
+            self.scheduler_stop_event.wait(1)
+    
+    def _start_tracking(self, sat_pass: Pass):
+        """
+        Private method to start tracking a pass
+        Only called by the scheduler
+        """
         with self.lock:
             if self.is_tracking:
                 return False
 
-            if not self.satellite:
-                if not self.load_satellite():
-                    return False
-                
             self.track_stop_event.clear()
-            # Find the next pass
-            next_pass = self._get_next_pass(deg=10.0, start_date=start_date)
-            if not next_pass:
-                self.gs_logger.error(f"No upcoming passes found for {self.satellite_name}")
-                return False
 
             # Update tracking data
             self.tracking_data["status"] = "waiting"
-            self.tracking_data["current_pass"] = next_pass
+            self.tracking_data["current_pass"] = sat_pass
 
             # Start tracking thread
             self.tracking_thread = threading.Thread(
                 target=self._track_satellite_thread,
-                args=(next_pass,)
+                args=(sat_pass,)
             )
             self.tracking_thread.daemon = True
             self.tracking_thread.start()
 
             self.is_tracking = True
-            self.gs_logger.info(f"Started tracking {self.satellite_name}, next pass at {next_pass.rise}")
+            self.gs_logger.info(f"Started tracking {self.satellite_name}, pass at {sat_pass.rise}")
             return True
+            
+    def _track_satellite_thread(self, sat_pass):
+        """Thread that handles tracking during a pass"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            loop.run_until_complete(self._async_track_satellite(sat_pass))
+        finally:
+            loop.close()
+            self._cleanup_tracking()
     
-    async def _track_satellite_thread(self, sat_pass):
-        """Track the satellite during a pass"""
+    async def _async_track_satellite(self, sat_pass):
+        """Async method to track satellite during a pass"""
         # Sleep till the rise time
         now = datetime.now(timezone.utc)
         time_till_rise = (sat_pass.rise - now).total_seconds()
@@ -244,19 +266,27 @@ class SatelliteTracker:
         if time_till_rise > 0:
             self.gs_logger.info(f"Waiting until rise time for {self.satellite_name}: {sat_pass.rise}")
             self.tracking_data["status"] = "waiting"
-            # Sleep until rise time
-            self.track_stop_event.wait(time_till_rise)
-
-         # Check if we were stopped during wait
+            
+            try:
+                # Sleep until rise time or until stopped
+                await asyncio.wait_for(
+                    asyncio.get_event_loop().create_future(), 
+                    timeout=time_till_rise
+                )
+            except asyncio.TimeoutError:
+                # This is expected when the timeout is reached
+                pass
+                
+            # Check if we were stopped during wait
             if self.track_stop_event.is_set():
                 self.gs_logger.info("Tracking was stopped during wait period")
-                self._cleanup_tracking()
                 return
+            
         # Update status
         self.tracking_data["status"] = "tracking"
         
         # Track the satellite during the pass
-        while self.is_tracking:
+        while not self.track_stop_event.is_set():
             now = datetime.now(timezone.utc)
             
             # Check if the pass is over
@@ -265,14 +295,13 @@ class SatelliteTracker:
                 break
             
             # Calculate position
-            difference = self.satellite - self.location
-            topocentric = difference.at(self.ts.now())
+            t = self.satellite.ts.now()
+            difference = self.satellite.satellite - self.satellite.location
+            topocentric = difference.at(t)
             alt, az, distance = topocentric.altaz()
             
-            # Send azimuth, elevation to rotctl
-            # subprocess.run(["rotctl", "P", az.degrees, alt.degrees])
+            # Send azimuth, elevation to rotor controller
             await self.rotor.write(az.degrees, alt.degrees)
-
             
             self.gs_logger.info(f"Setting azimuth: {az.degrees}, elevation: {alt.degrees}")
 
@@ -290,71 +319,86 @@ class SatelliteTracker:
                 break
                 
             # Sleep for a short time before updating
-            threading.Event().wait(1)
-        
-        # Update status
-        self.tracking_data["status"] = "idle"
-        self.is_tracking = False
-    
-    def stop_tracking(self):
-        """Stop tracking the satellite"""
-        with self.lock:    
-            if not self.is_tracking:
-                return False
-            self.track_stop_event.set()
-            
-            # Wait for thread to finish (with timeout)
-            if self.tracking_thread and self.tracking_thread.is_alive():
-                self.tracking_thread.join(timeout=2.0)
-            
+            await asyncio.sleep(1)
+
+    def _cleanup_tracking(self):
+        """Clean up after tracking has finished"""
+        with self.lock:
             # Update status
             self.tracking_data["status"] = "idle"
             self.tracking_data["current_pass"] = None
             self.is_tracking = False
             
-            self.gs_logger.info(f"Stopped tracking satellite {self.satellite_name}")
+            self.gs_logger.info(f"Finished tracking satellite {self.satellite_name}")
+    
+    def cancel_pass(self, rise_time_iso: str) -> bool:
+        """
+        Cancel a scheduled pass by its rise time
+        Args:
+            rise_time_iso: ISO formatted rise time string (from the pass.to_dict() output)
+        """
+        with self.lock:
+            rise_time = datetime.fromisoformat(rise_time_iso).replace(tzinfo=timezone.utc)
+            
+            # Search for the pass with the matching rise time
+            temp_queue = PriorityQueue()
+            found = False
+            
+            while not self.scheduled_passes.empty():
+                pass_obj = self.scheduled_passes.get()
+                
+                # If this is the pass we're looking for, don't put it back
+                if abs((pass_obj.rise - rise_time).total_seconds()) < 3600:  # Within 1 hour
+                    found = True
+                    self.gs_logger.info(f"Cancelled pass at {pass_obj.rise}")
+                else:
+                    temp_queue.put(pass_obj)
+                
+            # Restore the queue (minus the cancelled pass)
+            while not temp_queue.empty():
+                self.scheduled_passes.put(temp_queue.get())
+                
+            # Update tracking data
+            self._update_scheduled_passes_list()
+            
+            return found
+    
+    def stop_scheduler(self):
+        """Stop the scheduler and clear all scheduled passes"""
+        with self.lock:
+            self.scheduler_stop_event.set()
+            
+            # Wait for thread to finish (with timeout)
+            if self.scheduler_thread and self.scheduler_thread.is_alive():
+                self.scheduler_thread.join(timeout=2.0)
+                
+            # Clear all scheduled passes
+            while not self.scheduled_passes.empty():
+                self.scheduled_passes.get()
+                
+            self._update_scheduled_passes_list()
+            self.is_scheduling = False
+            
+            # Also stop any ongoing tracking
+            if self.is_tracking:
+                self.track_stop_event.set()
+                if self.tracking_thread and self.tracking_thread.is_alive():
+                    self.tracking_thread.join(timeout=2.0)
+                self._cleanup_tracking()
+                
+            self.gs_logger.info("Stopped scheduler and cleared all scheduled passes")
             return True
     
     def get_tracking_data(self):
-        """Get the latest tracking data"""
-        return {
-            "satellite": self.satellite_name,
-            "azimuth": self.tracking_data["azimuth"],
-            "elevation": self.tracking_data["elevation"],
-            "distance": self.tracking_data["distance"],
-            "status": self.tracking_data["status"],
-            "last_updated": self.tracking_data["last_updated"],
-            "pass": self.tracking_data["current_pass"].to_dict() if self.tracking_data["current_pass"] else None
-        }
-    
-    def reload_satellite(self):
-        """Reload the satellite. This should be done when there is a fresh TLE"""
+        """Get the latest tracking data including scheduled passes"""
         with self.lock:
-            self.gs_logger.info(f"Reloading satellite {self.satellite_name}")
-        
-            if self.is_tracking:
-                self.gs_logger.error("Cannot reload satellite while GS is tracking")
-                return False
-        
-        return self.load_satellite()
-    
-    def initialize_scheduler(self):
-        """Initialize the pass scheduler"""
-        from scheduler import PassScheduler  # Import here to avoid circular imports
-        self.pass_scheduler = PassScheduler(self)
-        self.pass_scheduler.start_scheduler()
-        return self.pass_scheduler
-    
-    # Add this method to get all scheduled passes
-    def get_scheduled_passes(self):
-        """Get all scheduled passes"""
-        if hasattr(self, 'pass_scheduler'):
-            return self.pass_scheduler.get_scheduled_passes()
-        return []
-    
-    # Add this method to schedule a specific pass
-    def schedule_pass(self, pass_obj):
-        """Schedule a specific pass"""
-        if hasattr(self, 'pass_scheduler'):
-            return self.pass_scheduler.schedule_pass(pass_obj)
-        return False
+            return {
+                "satellite": self.satellite_name,
+                "azimuth": self.tracking_data["azimuth"],
+                "elevation": self.tracking_data["elevation"],
+                "distance": self.tracking_data["distance"],
+                "status": self.tracking_data["status"],
+                "last_updated": self.tracking_data["last_updated"],
+                "current_pass": self.tracking_data["current_pass"].to_dict() if self.tracking_data["current_pass"] else None,
+                "scheduled_passes": self.tracking_data["scheduled_passes"]
+            }

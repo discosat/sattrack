@@ -4,9 +4,6 @@ from api.dependencies import get_tracker
 
 rotor_router = APIRouter()
 
-
-
-
 @rotor_router.get('/status')
 async def rotor_status(tracker = Depends(get_tracker)):
     """Get the rotor status from rotctl"""

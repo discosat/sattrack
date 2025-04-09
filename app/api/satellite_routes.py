@@ -2,10 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from datetime import datetime, timezone, timedelta
 from skyfield.api import wgs84
 from api.dependencies import get_tracker
-
+from pydantic import BaseModel
 satellite_router = APIRouter()
 
-@satellite_router.get('/')
+@satellite_router.get('')
 async def get_satellite_info(tracker = Depends(get_tracker)):
     """Get information about the tracked satellite"""
     return {
@@ -17,7 +17,7 @@ async def get_satellite_info(tracker = Depends(get_tracker)):
 @satellite_router.get('/position')
 async def get_satellite_position(tracker = Depends(get_tracker)):
     """Get current position of the satellite"""
-    position = tracker.get_sat_position()
+    position = tracker.satellite.get_sat_position()
     if position:
         return position
     raise HTTPException(status_code=404, detail="Satellite position not available")
@@ -36,7 +36,7 @@ async def get_satellite_passes(
     start_time = datetime.now(timezone.utc)
     end_time = start_time + timedelta(days=days)
 
-    passes = tracker.get_passes(start_time, end_time, min_elevation=min_elevation)
+    passes = tracker.satellite.get_passes(start_time, end_time, min_elevation=min_elevation)
     return [p.to_dict() for p in passes]
 
 @satellite_router.get('/next-pass')
@@ -47,7 +47,7 @@ async def get_next_pass(
     """Get the next pass for the satellite""" 
     if min_elevation < 5:
         raise HTTPException(status_code=400, detail="Minimum elevation must be greater than 5")   
-    next_pass = tracker.get_next_pass(min_elevation=min_elevation)
+    next_pass = tracker.satellite.get_next_pass(min_elevation=min_elevation)
     if next_pass is None:
         raise HTTPException(status_code=404, detail="No upcoming passes found")
 
@@ -59,20 +59,39 @@ async def reload_sat_tle(tracker = Depends(get_tracker)):
     success = tracker.reload_satellite()
     return {"success": success}
 
-@satellite_router.post('/track/start')
-async def start_satellite_tracking(tracker = Depends(get_tracker)):
-    """Start tracking the satellite"""
-    success = tracker.start_tracking()
-    return {"success": success}
-
-@satellite_router.post('/track/stop')
-async def stop_satellite_tracking(tracker = Depends(get_tracker)):
-    """Stop tracking the satellite"""
-    success = tracker.stop_tracking()
-    return {"success": success}
-
 @satellite_router.get('/track/data')
 async def get_tracking_data(tracker = Depends(get_tracker)):
     """Get the latest tracking data"""
     data = tracker.get_tracking_data()
     return data
+
+@satellite_router.post('/track/schedule')
+async def schedule_pass(rise: str, tracker = Depends(get_tracker)):
+    """Rise must be given in UTC and in ISO format. Finds next available pass from given rise"""
+    try:
+        rise_date = datetime.fromisoformat(rise)
+        rise_date = rise_date.replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid datetime format, use ISO format")
+    
+    success = tracker.schedule_pass(rise_date)
+    if not success:
+        raise HTTPException(status_code=400, detail="Failed to schedule pass. Check for overlap or time constraints")
+    
+    return {"message": "Pass scheduled successfully", "success": success}
+
+@satellite_router.post('/track/cancel/pass')
+async def cancel_pass(rise: str, tracker = Depends(get_tracker)):
+    success = tracker.cancel_pass(rise)
+    if not success:
+        raise HTTPException(status_code=404, detail="Pass not found or already completed")
+    return {"message": "Pass cancelled successfully"}
+
+@satellite_router.post('/track/cancel/all')
+async def cancel_all_passes(tracker = Depends(get_tracker)):
+    """Cancel all scheduled passes"""
+    tracker.stop_scheduler()
+    # Restart the scheduler
+    tracker._start_scheduler()
+    
+    return {"message": "All passes cancelled successfully"}

@@ -33,6 +33,5 @@ app.include_router(system_router, prefix='/system')
 app.include_router(rotor_router, prefix='/rotor')
 
 if __name__ == "__main__":
-    # Automatically create the logs folder if not there
     logger.info("Starting FastAPI server with uvicorn")
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
