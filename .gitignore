@@ -4,3 +4,4 @@ logs/groundstation.log
 app/__pycache__
 __pycache__
 schedueled_passes.json
+disco.tle
