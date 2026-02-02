@@ -27,19 +27,9 @@ LOGGING_CONFIG = {
         },
     },
     "loggers": {
-        "uvicorn": {
+        "api": {
             "handlers": ["console", "api_file"],  # Log to both console and file
             "level": "INFO",
-            "propagate": False,
-        },
-        "uvicorn.access": {
-            "handlers": ["console", "api_file"],
-            "level": "INFO",
-            "propagate": False,
-        },
-        "uvicorn.error": {
-            "handlers": ["console", "api_file"],
-            "level": "ERROR",
             "propagate": False,
         },
         "groundstation":{

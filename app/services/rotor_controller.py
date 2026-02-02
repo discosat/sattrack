@@ -70,3 +70,20 @@ class RotorController:
         future = asyncio.run_coroutine_threadsafe(cls._write(az, el), cls.loop)
         future.result()
         return
+
+
+class DebugRotorController:
+
+    @classmethod
+    async def initialize(cls):
+        return cls
+
+
+    @classmethod
+    async def read(cls):
+        print("reading from rotor controller")
+        return 0, 0
+
+    @classmethod
+    async def write(cls, az, el):
+        print(f"writing {az},{el} to rotor controller")

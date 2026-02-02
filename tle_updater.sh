@@ -1,9 +1,16 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 if [ -z "$1" ] 
     then
         echo "No argument supplied"
         exit 1
+fi
+
+ping -c 3 celestrak.org &>/dev/null
+
+if [ "$?" != 0 ]; then
+  echo "cannot reach celestrack.org"
+  exit 2
 fi
 
 # URL to fetch the TLE data

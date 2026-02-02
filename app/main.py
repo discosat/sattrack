@@ -1,13 +1,12 @@
-from fastapi import FastAPI
 import logging
+import logging.config
 import os
-import uvicorn
+import sys
 
+import asyncio
 from config.logging_config import LOGGING_CONFIG
-from api.satellite_routes import satellite_router
-from api.system_routes import system_router
-from api.rotor_routes import rotor_router
-from api.dependencies import create_tracker
+from api.router import Router
+from services.satellite_tracker import SatelliteTracker
 from contextlib import asynccontextmanager
 
 os.makedirs("logs", exist_ok=True)
@@ -15,23 +14,42 @@ os.makedirs("logs", exist_ok=True)
 logging.config.dictConfig(LOGGING_CONFIG)
 
 # Configure general logger
-logger = logging.getLogger("groundstation")
+gs_logger = logging.getLogger("groundstation")
+api_logger = logging.getLogger("api")
 
 
-@asynccontextmanager
-async def lifespan(app : FastAPI):
-    await create_tracker()
-
-    yield
-    #shutdown code can go here i guess
+api_logger.setLevel("DEBUG")
 
 
-app = FastAPI(lifespan=lifespan)
 
-app.include_router(satellite_router, prefix='/satellite')
-app.include_router(system_router, prefix='/system')
-app.include_router(rotor_router, prefix='/rotor')
+CONFIG_DIR = os.path.join(os.path.dirname(__file__), "config")
+serve_conf_file = os.path.join(CONFIG_DIR, "serve.conf")
+tle_script = os.path.join(os.path.dirname(__file__), "../tle_updater.sh")
+
+
+with open(serve_conf_file, 'r') as file:
+    conf = file.read().strip().split(":")
+    ip = conf[0]
+    port = int(conf[1])
+
+
+async def main():
+    try:
+        tracker = await SatelliteTracker.initialize(gs_logger)
+        router = Router(api_logger, ip, port, tracker, tle_script)
+        await router.connect()
+        await router.work()
+    except Exception as e:
+        gs_logger.critical(e)
+        gs_logger.info("shutting down")
+        sys.exit(-1)
+
 
 if __name__ == "__main__":
-    logger.info("Starting FastAPI server with uvicorn")
-    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
+    # Automatically create the logs folder if not there
+    gs_logger.info("Starting server")
+
+    asyncio.run(main())
+
+
+

@@ -5,7 +5,7 @@ import os
 from queue import PriorityQueue
 from typing import Optional, List
 import json
-from services.rotor_controller import RotorController
+from services.rotor_controller import DebugRotorController, RotorController
 from services.satellite import Satellite, Pass
 
 PERSISTENCE_FOLDER = os.path.join(os.path.dirname(__file__), "../persistence") 
@@ -26,6 +26,10 @@ class SatelliteTracker:
         self.scheduler_thread = None
         self.scheduler_stop_event = threading.Event()
         self.is_scheduling = False
+
+        self.submitter_thread = None
+        self.submitting_forever = False
+
         
         # Tracking data
         self.tracking_data = {
@@ -47,8 +51,12 @@ class SatelliteTracker:
     
     async def _async_init(self):
         """Asynchronous initialization for the rotor controller"""
-        self.rotor = await RotorController.initialize()
+        
+        #self.rotor = await RotorController.initialize()
+        self.rotor = await DebugRotorController.initialize()
         return self
+    def get_rotor(self):
+        return self.rotor
     
     @classmethod
     async def initialize(cls, gs_logger):
@@ -64,6 +72,25 @@ class SatelliteTracker:
                 return False
                 
             return self.satellite.load_satellite()
+
+    def submit_all_passes(self):
+        """makes the rotor track during all of the future passes unless cancelled"""
+        if self.submitting_forever:
+            return
+        else: 
+            self.submitting_forever = True
+        self.submitter_thread = threading.Thread(target=self._submit_all_passes)
+        self.submitter_thread.start()
+
+    def _submit_all_passes(self):
+        """the worker thread that submits all passes to the scheduler"""
+        while not self.scheduler_stop_event.is_set():
+            passes = self.satellite.get_passes()
+            for p in passes:
+                self.gs_logger.info(p.rise)  
+                self.schedule_pass(p.rise - timedelta(minutes = 5))
+            self.scheduler_stop_event.wait(timedelta(days=1).total_seconds())
+
     
     def _can_schedule_pass(self, pass_to_schedule: Pass) -> bool:
         """
@@ -133,7 +160,7 @@ class SatelliteTracker:
             # Update list of scheduled passes for API
             self._update_scheduled_passes_list()
                 
-            self.gs_logger.info(f"Scheduled pass at {pass_to_schedule.rise}")
+            self.gs_logger.info(f"Scheduled pass at {pass_to_schedule.rise} to {pass_to_schedule.set}")
             return True
             
     def _update_scheduled_passes_list(self):
@@ -336,6 +363,7 @@ class SatelliteTracker:
             
             self.gs_logger.info(f"Setting azimuth: {az.degrees}, elevation: {alt.degrees}")
 
+
             # Update tracking data
             self.tracking_data.update({
                 "azimuth": az.degrees,
@@ -402,6 +430,9 @@ class SatelliteTracker:
             # Wait for thread to finish (with timeout)
             if self.scheduler_thread and self.scheduler_thread.is_alive():
                 self.scheduler_thread.join(timeout=2.0)
+
+            if self.submitter_thread and self.submitter_thread.is_alive():
+                self.submitter_thread.join(timeout=2.0)
                 
             # Clear all scheduled passes
             while not self.scheduled_passes.empty():
@@ -409,6 +440,7 @@ class SatelliteTracker:
                 
             self._update_scheduled_passes_list()
             self.is_scheduling = False
+            self.submitting_forever = False
             
             # Also stop any ongoing tracking
             if self.is_tracking:
